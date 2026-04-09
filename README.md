@@ -311,12 +311,4 @@ Building this from scratch taught me:
 
 ---
 
-## Inspired By
-
-- [Tiny-OpenClaw](https://github.com/ashishbamania/Tiny-OpenClaw) by Ashish Bamania
-- [How to Build an Autonomous AI Agent like OpenClaw](https://blog.algomaster.io/p/how-to-build-an-autonomous-ai-agent-like-openclaw) — AlgoMaster Blog
-- [Anthropic's tool use documentation](https://docs.anthropic.com/en/docs/tool-use)
-
----
-
 <p align="center">Built with curiosity by <a href="https://github.com/abhay-codes07">abhay-codes07</a> • Powered by Claude 🦞</p>
