@@ -1,0 +1,26 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tiny-OpenClaw — docker-compose
+#
+# Usage:
+#   cp .env.example .env  # fill in your keys
+#   docker-compose up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  tiny-openclaw:
+    build: .
+    image: tiny-openclaw:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist conversation history and memory outside the container
+      - ./SESSIONS.json:/app/SESSIONS.json
+      - ./MEMORY.json:/app/MEMORY.json
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
