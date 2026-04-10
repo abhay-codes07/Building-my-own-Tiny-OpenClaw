@@ -18,11 +18,14 @@
 This is my from-scratch implementation of a **ReAct (Reason + Act)** AI agent, inspired by the [Tiny-OpenClaw tutorial](https://blog.algomaster.io/p/how-to-build-an-autonomous-ai-agent-like-openclaw) by Ashish Bamania.
 
 The agent:
-- Receives messages on **Telegram**
+- Receives messages **and photos** on Telegram
+- **Streams responses** in real time — edits the message live as Claude generates tokens
 - **Thinks** about what to do using Claude claude-opus-4-6
-- **Acts** by calling tools (skills) like web search, browser control, weather, calculator…
+- **Acts** by calling tools (skills) like web search, browser control, weather, calculator, file ops…
 - **Observes** the results and loops until it has a final answer
 - **Remembers** facts about you across sessions
+- **Analyses images** you send via Claude Vision
+- **Schedules reminders** that fire asynchronously after a delay
 
 > This project is a learning exercise — I built every component myself to understand how autonomous agents actually work under the hood.
 
@@ -101,8 +104,10 @@ Call Anthropic API  ◄───────────────────
 | `web_search` | `search_web` | DuckDuckGo search, no API key needed |
 | `weather` | `get_weather` | Current conditions + 3-day forecast via Open-Meteo |
 | `calculator` | `calculate` | Safe AST-based math evaluator |
+| `file_ops` | `read_file`, `write_file`, `list_files`, `delete_file` | Sandboxed local file access in `workspace/` |
+| `reminder` | `set_reminder`, `cancel_reminders` | Async Telegram reminders via asyncio |
 
-> The reference Tiny-OpenClaw has 3 skills. I added **web_search**, **weather**, and **calculator** — each built from scratch.
+> The reference Tiny-OpenClaw has 3 skills. I added **web_search**, **weather**, **calculator**, **file_ops**, and **reminder** — each built from scratch.
 
 ---
 
@@ -111,28 +116,35 @@ Call Anthropic API  ◄───────────────────
 ```
 .
 ├── main.py               # Entry point — wires all components together
-├── agent_runtime.py      # ReAct loop + Anthropic API client
+├── agent_runtime.py      # ReAct loop + SSE streaming Anthropic client
 ├── context_builder.py    # Assembles system prompt from all sources
 ├── skill_loader.py       # Discovers and dispatches skill plugins
 ├── session_manager.py    # Per-user conversation history (JSON)
 ├── memory.py             # Key-value persistent store (JSON)
-├── telegram_channel.py   # Telegram bot adapter + /start /reset /info
+├── telegram_channel.py   # Telegram adapter: text, photos, streaming editor
 ├── logger.py             # Coloured structured logging
+├── make_skill.py         # CLI scaffold for new skills
 ├── SOUL.md               # Agent personality and rules
 ├── .env.example          # Environment variable template
 ├── pyproject.toml        # Dependencies + project metadata
 ├── Dockerfile            # Container image with Playwright deps
+├── docker-compose.yml    # One-command deployment
 ├── skills/
 │   ├── datetime/         # Current time tool
-│   ├── memory_work/      # Save/recall user notes
-│   ├── browser_use/      # Playwright web automation
-│   ├── web_search/       # DuckDuckGo search (NEW)
-│   ├── weather/          # Open-Meteo weather (NEW)
-│   └── calculator/       # Safe math evaluator (NEW)
+│   ├── memory_work/      # Save/recall user notes (4 tools)
+│   ├── browser_use/      # Playwright web automation (5 tools)
+│   ├── web_search/       # DuckDuckGo search
+│   ├── weather/          # Open-Meteo weather + forecast
+│   ├── calculator/       # AST-safe math evaluator
+│   ├── file_ops/         # Sandboxed local file read/write/list/delete
+│   └── reminder/         # Async Telegram reminders via asyncio
+├── workspace/            # Sandbox for file_ops skill (gitkeep'd)
 └── tests/
     ├── test_memory.py
     ├── test_session_manager.py
-    └── test_calculator.py
+    ├── test_calculator.py
+    ├── test_context_builder.py
+    └── test_skill_loader.py
 ```
 
 ---
@@ -291,7 +303,12 @@ pytest tests/ -v
 |----------|--------|
 | ReAct loop over single-shot | Enables sequential tool use and multi-step reasoning |
 | `MAX_TOOL_ROUNDS = 5` | Prevents infinite loops while allowing complex tasks |
+| SSE streaming for all rounds | Users see tokens in real time; thinking text in tool rounds is informative |
+| `_StreamEditor` throttle (60 chars or 1 s) | Respects Telegram's ~20 edits/min limit without jarring updates |
+| Vision as a content block | Anthropic natively supports `image` blocks — no separate vision endpoint needed |
+| `asyncio.create_task` for reminders | Fire-and-forget — reminder schedules instantly, fires later without blocking |
 | JSON persistence | Zero infrastructure — no database needed for a local agent |
+| `workspace/` sandbox for file ops | Path traversal blocked via `os.path.realpath()` comparison |
 | AST-based calculator | Avoids `eval()` on untrusted strings — safe math only |
 | DuckDuckGo (no key) | Aligns with SOUL.md rules; no API signup required |
 | Open-Meteo weather | Completely free, no API key, good coverage |
@@ -308,6 +325,9 @@ Building this from scratch taught me:
 3. **System prompt layering** — combining personality, skills, memory, and time context gives the LLM everything it needs
 4. **Bounded loops matter** — without `MAX_TOOL_ROUNDS`, a confused model can spiral into infinite tool calls
 5. **Skills as plugins** — `importlib` dynamic loading makes the architecture clean and extensible
+6. **SSE streaming is easy with httpx** — `client.stream()` + `aiter_lines()` handles Anthropic's SSE format cleanly
+7. **Vision is just a content block** — sending images to Claude requires no special endpoint, just a base64 block in the message array
+8. **asyncio.create_task is perfect for background jobs** — fire-and-forget reminders work reliably without threading
 
 ---
 
