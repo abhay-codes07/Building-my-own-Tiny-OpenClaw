@@ -10,8 +10,8 @@ On each user turn the runtime:
   4. Repeats until the model returns a plain text answer or the
      MAX_TOOL_ROUNDS cap is reached
 
-Only the Anthropic API is wired up, but the provider/model fields are
-kept in __init__ so swapping to OpenAI is a one-function change.
+Responses are streamed via SSE so the Telegram channel can edit the
+message in-place as tokens arrive instead of waiting for the full reply.
 """
 
 import json
@@ -23,16 +23,14 @@ from logger import get_logger
 
 log = get_logger(__name__)
 
-# Hard cap: prevents runaway tool loops
 MAX_TOOL_ROUNDS = 5
 
-# Anthropic API endpoint
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_URL     = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 
 
 class AgentRuntime:
-    """Runs the agent loop for a single user turn."""
+    """Runs the ReAct agent loop for a single user turn."""
 
     def __init__(self, provider: str, model: str, api_key: str, skills, memory):
         self.provider = provider
@@ -45,25 +43,18 @@ class AgentRuntime:
         """
         Execute one full agent turn.
 
-        Parameters
-        ----------
-        history    : full conversation history for this session
-        session_id : used to pass session context to skills
-        callbacks  : {
-            "on_token":    async fn(text)   — called with the final response
-            "on_tool_use": async fn(name, input) — called before each tool call
-          }
-
-        Returns the final text response.
+        callbacks keys
+        --------------
+        on_chunk    : async fn(str)        — called with each streamed text chunk
+        on_tool_use : async fn(name, input) — called before each tool execution
         """
-        on_token    = callbacks.get("on_token")
+        on_chunk    = callbacks.get("on_chunk")
         on_tool_use = callbacks.get("on_tool_use")
 
         system_prompt = build_system_prompt(
             self.skills.get_active_skills(), self.memory
         )
 
-        # Convert history entries to Anthropic message format
         messages = [
             {"role": m["role"], "content": m["content"]}
             for m in history
@@ -73,19 +64,19 @@ class AgentRuntime:
         response_text = ""
         rounds = 0
 
-        log.info("Agent run started — session=%s, history=%d msgs", session_id, len(messages))
+        log.info("Agent run started — session=%s  history=%d msgs", session_id, len(messages))
 
         while rounds < MAX_TOOL_ROUNDS:
             rounds += 1
             log.debug("ReAct round %d/%d", rounds, MAX_TOOL_ROUNDS)
 
-            result = await self._call_anthropic(system_prompt, messages, tools or None)
+            result = await self._stream_anthropic(
+                system_prompt, messages, tools or None, on_chunk=on_chunk
+            )
 
             if result["tool_calls"]:
-                # Append the assistant's tool-request message
                 messages.append({"role": "assistant", "content": result["raw_content"]})
 
-                # Execute every requested tool and collect results
                 tool_results = []
                 for tc in result["tool_calls"]:
                     log.info("Tool call: %s  input=%s", tc["name"], tc["input"])
@@ -95,7 +86,11 @@ class AgentRuntime:
                     tool_result = await self.skills.execute_tool(
                         tc["name"],
                         tc["input"],
-                        {"session_id": session_id, "memory": self.memory},
+                        {
+                            "session_id":   session_id,
+                            "memory":       self.memory,
+                            "send_message": callbacks.get("send_message"),
+                        },
                     )
                     log.debug("Tool result for %s: %s", tc["name"], tool_result)
 
@@ -106,38 +101,49 @@ class AgentRuntime:
                     })
 
                 messages.append({"role": "user", "content": tool_results})
-                continue  # next ReAct round
+                continue
 
-            # No tool calls — we have the final answer
             if result["text"]:
                 response_text = result["text"]
-                if on_token:
-                    await on_token(response_text)
 
             break
 
         if rounds >= MAX_TOOL_ROUNDS and not response_text:
             log.warning("Hit MAX_TOOL_ROUNDS (%d) without a final answer", MAX_TOOL_ROUNDS)
-            response_text = "I ran into a loop and couldn't complete the task. Please try rephrasing."
-            if on_token:
-                await on_token(response_text)
+            fallback = "I got stuck in a loop and couldn't finish. Please try rephrasing."
+            if on_chunk:
+                await on_chunk(fallback)
+            response_text = fallback
 
         log.info("Agent run complete — %d round(s)", rounds)
         return response_text
 
     # ------------------------------------------------------------------
-    # Anthropic API
+    # Streaming Anthropic API call
     # ------------------------------------------------------------------
 
-    async def _call_anthropic(
-        self, system_prompt: str, messages: list[dict], tools: list[dict] | None
+    async def _stream_anthropic(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict] | None,
+        on_chunk=None,
     ) -> dict:
-        """POST to the Anthropic Messages API and return a normalised result."""
+        """
+        Call the Anthropic Messages API with streaming (SSE) enabled.
+
+        Text deltas are forwarded to on_chunk() as they arrive so the
+        caller can display tokens in real time.  Tool-use blocks are
+        accumulated silently and returned in the same dict format as
+        the old non-streaming _call_anthropic(), so the ReAct loop
+        doesn't need to change.
+        """
         body: dict = {
             "model":      self.model,
             "max_tokens": 4096,
             "system":     system_prompt,
             "messages":   messages,
+            "stream":     True,
         }
 
         if tools:
@@ -150,43 +156,98 @@ class AgentRuntime:
                 for t in tools
             ]
 
+        # blocks[index] accumulates each content block as SSE events arrive
+        blocks: dict[int, dict] = {}
+
+        headers = {
+            "Content-Type":      "application/json",
+            "x-api-key":         self.api_key,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+        }
+
         try:
             async with httpx.AsyncClient(timeout=120) as client:
-                res = await client.post(
-                    ANTHROPIC_API_URL,
-                    headers={
-                        "Content-Type":    "application/json",
-                        "x-api-key":       self.api_key,
-                        "anthropic-version": ANTHROPIC_API_VERSION,
-                    },
-                    json=body,
-                )
+                async with client.stream(
+                    "POST", ANTHROPIC_API_URL, headers=headers, json=body
+                ) as resp:
+                    if resp.status_code != 200:
+                        body_text = await resp.aread()
+                        raise RuntimeError(
+                            f"Anthropic API error {resp.status_code}: {body_text.decode()}"
+                        )
+
+                    async for raw_line in resp.aiter_lines():
+                        if not raw_line.startswith("data: "):
+                            continue
+                        payload = raw_line[6:]
+                        if payload.strip() == "[DONE]":
+                            break
+
+                        try:
+                            event = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+
+                        etype = event.get("type")
+
+                        if etype == "content_block_start":
+                            idx = event["index"]
+                            cb  = event["content_block"]
+                            if cb["type"] == "text":
+                                blocks[idx] = {"type": "text", "text": ""}
+                            elif cb["type"] == "tool_use":
+                                blocks[idx] = {
+                                    "type":       "tool_use",
+                                    "id":         cb["id"],
+                                    "name":       cb["name"],
+                                    "input_json": "",
+                                }
+
+                        elif etype == "content_block_delta":
+                            idx   = event["index"]
+                            delta = event["delta"]
+                            if delta["type"] == "text_delta":
+                                chunk = delta["text"]
+                                blocks[idx]["text"] += chunk
+                                if on_chunk and chunk:
+                                    await on_chunk(chunk)
+                            elif delta["type"] == "input_json_delta":
+                                blocks[idx]["input_json"] += delta.get("partial_json", "")
+
         except httpx.ConnectError as exc:
             raise RuntimeError(f"Cannot reach Anthropic API: {exc}") from exc
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"Anthropic API timed out: {exc}") from exc
 
-        if res.status_code != 200:
-            raise RuntimeError(
-                f"Anthropic API error {res.status_code}: {res.text}"
-            )
-
-        data = res.json()
+        # Reconstruct normalised result from accumulated blocks
         text_parts: list[str] = []
         tool_calls: list[dict] = []
+        raw_content: list[dict] = []
 
-        for block in data.get("content", []):
+        for idx in sorted(blocks):
+            block = blocks[idx]
             if block["type"] == "text":
                 text_parts.append(block["text"])
+                raw_content.append({"type": "text", "text": block["text"]})
             elif block["type"] == "tool_use":
+                try:
+                    input_data = json.loads(block["input_json"]) if block["input_json"] else {}
+                except json.JSONDecodeError:
+                    input_data = {}
                 tool_calls.append({
                     "id":    block["id"],
                     "name":  block["name"],
-                    "input": block["input"],
+                    "input": input_data,
+                })
+                raw_content.append({
+                    "type":  "tool_use",
+                    "id":    block["id"],
+                    "name":  block["name"],
+                    "input": input_data,
                 })
 
         return {
             "text":        "".join(text_parts),
             "tool_calls":  tool_calls or None,
-            "raw_content": data["content"],
+            "raw_content": raw_content,
         }
